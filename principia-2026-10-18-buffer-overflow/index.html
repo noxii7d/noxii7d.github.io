@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Principia Buffer Overflow Vulnerability</title>
+
+	<style>
+body {
+	background-color: #f5f5f5;
+	color: #111;
+	max-width: 960px;
+	margin: auto;
+}
+
+p, li {
+	line-height: 1.5;
+}
+
+pre {
+	background-color: #cccccc;
+	padding: 10px;
+}
+
+ins, del {
+	text-decoration: none;
+}
+ins {
+	color: #039e03;
+}
+del {
+	color: red;
+}
+
+@media (prefers-color-scheme: dark) {
+	body {
+		background-color: #111;
+		color: #eaeaea;
+	}
+
+	a {
+		color: #0af;
+	}
+
+	pre {
+		background-color: #181818;
+	}
+}
+	</style>
+</head>
+<body>
+	<h1>Principia Buffer Overflow Vulnerability</h1>
+
+	<p><strong>Reported by:</strong> Grace "Noxii"</p>
+
+	<p><strong>Date of discovery:</strong> 18 October 2026</p>
+
+	<p><strong>Date of publication:</strong> 22 October 2026</p>
+
+	<p><strong>Severity:</strong> Medium</p>
+
+	<p><strong>Affected versions:</strong> Principia 2026.09.19 and below</p>
+
+	<p><strong>Fixed in:</strong> Principia 2026.10.22</p>
+
+	<p>This write-up details a buffer overflow vulnerability which existed in file parser logic for featured levels in the open source project Principia. As this file gets loaded from over the network, this poses a risk where a victim connecting to a malicious community site could receive it and have a maliciously crafted file get parsed by the game.</p>
+
+	<h2>Background</h2>
+
+	<p>Principia is an open source physics-based sandbox game with a codebase written in C/C++. Part of the game is the main community site at principia-web.se, which contains user created levels, and the game makes network connections to this website by default.</p>
+
+	<p>In the main menu of the game, four featured levels get shown from the currently chosen Principia community site. The default is principia-web.se, but can be changed by the user to point to any domain. The game makes a request to <code>/internal/get_featured</code> and receives a custom binary payload containing metadata about the featured levels, and gets written to disk as "fl.cache". If a network connection cannot be made, the game will use the locally provided "fl.cache" in the Principia cache directory.</p>
+
+	<p>A Kaitai Struct file for the custom binary format is provided by the project in <a href="https://github.com/Bithack/principia/blob/master/utils/kaitai/featuredlist.ksy">utils/kaitai/featuredlist.ksy</a>, and the main parsing logic exists in the function <code>parse_featured_levels</code> in <code>src/network.cc</code>.</p>
+
+	<h2>The vulnerability</h2>
+
+	<p>When parsing the custom binary format, the game reads lengths as 32-bit unsigned integers for name and creator strings. This is then copied into <code>menu_shared::fl</code> with <code>strcpy</code>.</p>
+
+<pre>uint32_t name_len = lb.r_uint32();
+char *name = (char*)calloc(name_len+1, 1);
+lb.r_buf(name, name_len);
+strcpy(menu_shared::fl[i].name, name);
+free(name);
+
+uint32_t creator_len = lb.r_uint32();
+char *creator = (char*)calloc(creator_len+1, 1);
+lb.r_buf(creator, creator_len);
+strcpy(menu_shared::fl[i].creator, creator);
+free(creator);</pre>
+
+	<p>The menu_shared::fl is a struct with the definition:</p>
+
+<pre>static struct featured_level {
+	struct tms_sprite *sprite;
+	uint32_t id;
+	char name[256];
+	char creator[256];
+} fl[MAX_FEATURED_LEVELS_FETCHED];</pre>
+
+	<p>As the name and creator fields can be significantly larger than 256 characters in the binary payload, while the struct only contains arrays 256 in length, this causes a buffer overflow if the length is not constrained due to the use of strcpy.</p>
+
+	<h2>Proof-of-Concept</h2>
+
+	<p>A Proof-of-concept to demonstrate the vulnerability would be to craft a file which contains extremely long name and creator strings. After disclosure to the maintainer, he wrote the following Python script to create a file that can reproduce a crash in the code:</p>
+
+	<pre>import struct
+
+def u32(value):
+    return struct.pack("&lt;I", value)
+
+def pstr(data):
+    return u32(len(data)) + data
+
+data = bytearray()
+data += u32(1) # featured_level_count
+data += u32(1) # level id
+data += pstr(b"A" * 8000) # level name
+data += pstr(b"B" * 8000) # level author
+data += u32(0) + u32(0) + u32(0)
+
+with open("fl_cache_poc.bin", "wb") as f:
+    f.write(data)
+</pre>
+
+	<p>This can be demonstrated by putting this file as "fl.cache" in the <a href="https://principia-web.se/wiki/Cache_Directory">cache directory</a> and putting a dummy value in community_host.txt to disable network connectivity.</p>
+
+	<p>Principia community site limits level titles to 128 characters in the database and usernames to 50 characters in the database. So a malicious user could not exploit this vulnerability by simply submitting a level with a very long title or username, and get their level featured through social engineering. It would require a malicious community site which the user points their client to and serves a payload such as this one on the <code>/internal/get_featured</code> endpoint.</p>
+
+	<h2>Fix</h2>
+
+	<p>Original fix was to limit the length of the name and creator fields to 255 characters when copying, using <code>strncpy</code> instead.</p>
+
+	<pre>--- a/src/network.cc
++++ b/src/network.cc
+@@ -103,13 +103,13 @@ bool parse_featured_levels(char *buf, size_t buf_size) {
+         uint32_t name_len = lb.r_uint32();
+         char *name = (char*)calloc(name_len+1, 1);
+         lb.r_buf(name, name_len);
+<del>-        strcpy(menu_shared::fl[i].name, name);</del>
+<ins>+        strncpy(menu_shared::fl[i].name, name, 255);</ins>
+         free(name);
+
+         uint32_t creator_len = lb.r_uint32();
+         char *creator = (char*)calloc(creator_len+1, 1);
+         lb.r_buf(creator, creator_len);
+<del>-        strcpy(menu_shared::fl[i].creator, creator);</del>
+<ins>+        strncpy(menu_shared::fl[i].creator, creator, 255);</ins>
+         free(creator);
+
+         uint32_t thumb_len = lb.r_uint32();</pre>
+
+	<p>After talking with a maintainer, he said that we never need to actually expect the fields to be that large for a normal file, and should simply return early out of the function. Once the length has been checked, the heap allocation can also be avoided and we copy the data directly into the struct.</p>
+
+	<pre>--- a/src/network.cc
++++ b/src/network.cc
+@@ -101,16 +101,20 @@ bool parse_featured_levels(char *buf, size_t buf_size) {
+         menu_shared::fl[i].id = lb.r_uint32();
+
+         uint32_t name_len = lb.r_uint32();
+<del>-        char *name = (char*)calloc(name_len+1, 1);
+-        lb.r_buf(name, name_len);
+-        strcpy(menu_shared::fl[i].name, name);
+-        free(name);</del>
+<ins>+        if (name_len > 255) {
++            tms_errorf("parse_featured_levels: Level name too big!");
++            return false;
++        }
++        lb.r_buf(menu_shared::fl[i].name, name_len);
++        menu_shared::fl[i].name[name_len] = '\0';</ins>
+
+         uint32_t creator_len = lb.r_uint32();
+<del>-        char *creator = (char*)calloc(creator_len+1, 1);
+-        lb.r_buf(creator, creator_len);
+-        strcpy(menu_shared::fl[i].creator, creator);
+-        free(creator);</del>
+<ins>+        if (creator_len > 255) {
++            tms_errorf("parse_featured_levels: Author name too big!");
++            return false;
++        }
++        lb.r_buf(menu_shared::fl[i].creator, creator_len);
++        menu_shared::fl[i].creator[creator_len] = '\0';</ins>
+
+         uint32_t thumb_len = lb.r_uint32();</pre>
+
+	<p><code>lvlbuf</code>, the class which is used for reading and writing binary data buffers in Principia already does bounds checking, so reading out of bounds will simply fill it with zero.</p>
+
+	<p>This final fix made it into Principia 2026.10.22 in commit <a href="https://github.com/Bithack/principia/commit/c8a92799a93693bef15c6ad223539e54ec339e32">c8a9279</a>, and has now been released.</p>
+
+	<p>In addition to these buffer overflow fixes, the Principia maintainer also identified additional parts in the featured level parser that had issues with potentially large memory allocations happening, and fixed those for the release too.</p>
+
+	<h2>Impact</h2>
+
+	<p>After consulting with the Principia maintainer, it was decided to go forward with classifying the issue as a security vulnerability rather than a bug due to its specific property of allowing a buffer overflow to be triggered over the network. Typically, such vulnerabilities are labelled with a severity of Medium due to the potential for remote memory corruption.</p>
+
+	<p>However, due to the likelihood of a malicious community site appearing and for players to be tricked into connecting to it being rather low, impact of the vulnerability is considered to be limited. Therefore the writeup is being published with proof of concept immediately after the release with the approval of the maintainer.</p>
+
+	<h2>Timeline</h2>
+
+	<ul>
+		<li><strong>October 18</strong> - Discovery, responsible disclosure to the Principia maintainer privately</li>
+		<li><strong>October 19-20</strong> - Maintainer accepts the vulnerability, reproduces it and collaborates on a fix</li>
+		<li><strong>October 22</strong> - Principia 2026.10.22 releases with the fix</li>
+		<li><strong>October 22</strong> - Detailed writeup is published with the approval of the maintainer</li>
+	</ul>
+
+	<p>I would like to thank the Principia maintainer, ROllerozxa, for also helping out with the creation of Proof-of-Concept and being a supportive helper for this writeup. :3</p>
+</body>
+</html>
